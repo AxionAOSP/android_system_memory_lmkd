@@ -96,7 +96,9 @@ static inline void trace_kill_end() {}
 #define PROC_STATUS_SWAP_FIELD "VmSwap:"
 
 #define PERCEPTIBLE_APP_ADJ 200
+#define PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ 50
 #define PREVIOUS_APP_ADJ 700
+#define VISIBLE_APP_ADJ 100
 
 /* Android Logger event logtags (see event.logtags) */
 #define KILLINFO_LOG_TAG 10195355
@@ -2647,6 +2649,10 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
 
 void calc_zone_watermarks(struct zoneinfo *zi, struct zone_watermarks *watermarks) {
     memset(watermarks, 0, sizeof(struct zone_watermarks));
+    int64_t max_high = 0;
+    int64_t max_low = 0;
+    int64_t max_min = 0;
+    int64_t max_protection = 0;
 
     for (int node_idx = 0; node_idx < zi->node_count; node_idx++) {
         struct zoneinfo_node *node = &zi->nodes[node_idx];
@@ -2657,11 +2663,16 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_watermarks *watermark
                 continue;
             }
 
-            watermarks->high_wmark += zone->max_protection + zone->fields.field.high;
-            watermarks->low_wmark += zone->max_protection + zone->fields.field.low;
-            watermarks->min_wmark += zone->max_protection + zone->fields.field.min;
+            max_high = std::max(max_high, zone->fields.field.high);
+            max_low = std::max(max_low, zone->fields.field.low);
+            max_min = std::max(max_min, zone->fields.field.min);
+            max_protection = std::max(max_protection, zone->max_protection);
         }
     }
+    // Kernel watermarks are per zone. But LMK operates on a single watermark. So, consider only the worst case of zone watermark.
+    watermarks->high_wmark = max_high + max_protection;
+    watermarks->low_wmark = max_low + max_protection;
+    watermarks->min_wmark = max_min + max_protection;
 }
 
 static int calc_swap_utilization(union meminfo *mi) {
@@ -2868,7 +2879,7 @@ update_watermarks:
      * TODO: move this logic into a separate function
      * Decide if killing a process is necessary and record the reason
      */
-    if (cycle_after_kill && wmark < WMARK_LOW) {
+    if (cycle_after_kill && wmark <= WMARK_LOW) {
         /*
          * Prevent kills not freeing enough memory which might lead to OOM kill.
          * This might happen when a process is consuming memory faster than reclaim can
@@ -2877,7 +2888,10 @@ update_watermarks:
         min_score_adj = pressure_after_kill_min_score;
         kill_reason = PRESSURE_AFTER_KILL;
         strncpy(kill_desc, "min watermark is breached even after kill", sizeof(kill_desc));
-    } else if (level == VMPRESS_LEVEL_CRITICAL && events != 0) {
+        if (wmark > WMARK_MIN) {
+            min_score_adj = VISIBLE_APP_ADJ;
+        }
+    } else if (level == VMPRESS_LEVEL_CRITICAL && (events != 0 || wmark <= WMARK_HIGH)) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
          * Critical level is triggered when PSI complete stall (all tasks are blocked because
@@ -2885,6 +2899,7 @@ update_watermarks:
          */
         kill_reason = NOT_RESPONDING;
         strncpy(kill_desc, "device is not responding", sizeof(kill_desc));
+        min_score_adj = pressure_after_kill_min_score;
     } else if (swap_is_low && thrashing > thrashing_limit_pct) {
         /* Page cache is thrashing while swap is low */
         kill_reason = LOW_SWAP_AND_THRASHING;
@@ -2896,7 +2911,7 @@ update_watermarks:
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
         }
         check_filecache = true;
-    } else if (swap_is_low && wmark < WMARK_HIGH) {
+    } else if (swap_is_low && wmark <= WMARK_HIGH) {
         /* Both free memory and swap are low */
         kill_reason = LOW_MEM_AND_SWAP;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap is low (%"
@@ -2916,16 +2931,14 @@ update_watermarks:
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap utilization"
             " is high (%d%% > %d%%)", wmark < WMARK_LOW ? "min" : "low",
             swap_util, swap_util_max);
-    } else if (wmark < WMARK_HIGH && thrashing > thrashing_limit) {
+    } else if (wmark <= WMARK_HIGH && thrashing > thrashing_limit) {
         /* Page cache is thrashing while memory is low */
         kill_reason = LOW_MEM_AND_THRASHING;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and thrashing (%"
             PRId64 "%%)", wmark < WMARK_LOW ? "min" : "low", thrashing);
         cut_thrashing_limit = true;
-        /* Do not kill perceptible apps unless thrashing at critical levels */
-        if (thrashing < thrashing_critical_pct) {
-            min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
-        }
+        min_score_adj = VISIBLE_APP_ADJ;
+
         check_filecache = true;
     } else if (reclaim == DIRECT_RECLAIM && thrashing > thrashing_limit) {
         /* Page cache is thrashing while in direct reclaim (mostly happens on lowram devices) */
@@ -2938,6 +2951,10 @@ update_watermarks:
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
         }
         check_filecache = true;
+    } else if (reclaim == DIRECT_RECLAIM && wmark <= WMARK_HIGH) {
+        kill_reason = DIRECT_RECL_AND_THRASHING;
+        strlcpy(kill_desc, "device is in direct reclaim and low on memory", sizeof(kill_desc));
+        min_score_adj = PERCEPTIBLE_APP_ADJ;
     } else if (reclaim == DIRECT_RECLAIM && direct_reclaim_threshold_ms > 0 &&
                direct_reclaim_duration_ms > direct_reclaim_threshold_ms) {
         kill_reason = DIRECT_RECL_STUCK;
@@ -3023,7 +3040,7 @@ no_kill:
     }
 
     /* Decide the polling interval */
-    if (swap_is_low || killing) {
+    if (swap_is_low || killing || level == VMPRESS_LEVEL_CRITICAL) {
         /* Fast polling during and after a kill or when swap is low */
         poll_params->polling_interval_ms = PSI_POLL_PERIOD_SHORT_MS;
     } else {
@@ -4010,7 +4027,7 @@ static bool update_props() {
     level_oomadj[VMPRESS_LEVEL_MEDIUM] =
         GET_LMK_PROPERTY(int32, "medium", 800);
     level_oomadj[VMPRESS_LEVEL_CRITICAL] =
-        GET_LMK_PROPERTY(int32, "critical", 0);
+        GET_LMK_PROPERTY(int32, "critical", 606);
     debug_process_killing = GET_LMK_PROPERTY(bool, "debug", false);
 
     /* By default disable upgrade/downgrade logic */
@@ -4026,7 +4043,7 @@ static bool update_props() {
     kill_timeout_ms =
         (unsigned long)GET_LMK_PROPERTY(int32, "kill_timeout_ms", 100);
     pressure_after_kill_min_score =
-        (unsigned long)GET_LMK_PROPERTY(int32, "pressure_after_kill_min_score", 0);
+        (unsigned long)GET_LMK_PROPERTY(int32, "pressure_after_kill_min_score", PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ);
     use_minfree_levels =
         GET_LMK_PROPERTY(bool, "use_minfree_levels", false);
     per_app_memcg =
