@@ -64,13 +64,18 @@ cc_binary {
         "-Werror",
         "-Wextra",
         "-DLMKD_TRACE_KILLS",
+        "-O3"
     ],
+    whole_program_vtables: true,
     init_rc: ["lmkd.rc"],
     defaults: [
         "stats_defaults",
         "lmkd_hooks_defaults",
     ],
     logtags: ["event.logtags"],
+    lto: {
+        thin: true,
+    },
     afdo: true,
 }
 
