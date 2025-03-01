@@ -76,6 +76,12 @@ cc_binary {
     lto: {
         thin: true,
     },
+    target: {
+        android_arm64: {
+            cflags: ["-fsplit-machine-functions"],
+            ldflags: ["-fsplit-machine-functions"],
+        }
+    },
     afdo: true,
 }
 
