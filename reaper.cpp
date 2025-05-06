@@ -31,6 +31,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ax_process_utils.h"
+
 #include <processgroup/processgroup.h>
 #include <system/thread_defs.h>
 
@@ -94,13 +96,21 @@ static void* reaper_main(void* param) {
     struct Reaper::target_proc target;
     pid_t tid = gettid();
 
-    // Ensure the thread does not use little cores
-    if (!SetTaskProfiles(tid, {"CPUSET_SP_FOREGROUND"}, true)) {
-        ALOGE("Failed to assign cpuset to the reaper thread");
+    // Ensure the thread does not use little cores (svp)
+    if (!SetTaskProfiles(tid, {"SvpPolicy"}, true)) {
+        if (!SetTaskProfiles(tid, {"CPUSET_SP_FOREGROUND"}, true)) {
+            ALOGE("Failed to assign cpuset to the reaper thread");
+        }
     }
 
     if (setpriority(PRIO_PROCESS, tid, ANDROID_PRIORITY_HIGHEST)) {
         ALOGW("Unable to raise priority of the reaper thread (%d): errno=%d", tid, errno);
+    }
+
+    if (axion::process::SetThreadAffinity(tid, 0)) {
+        ALOGW("Failed to set reaper thread CPU affinity to big cores!");
+    } else {
+        ALOGI("Successfully set reaper thread CPU affinity to big cores!");
     }
 
     for (;;) {
