@@ -19,9 +19,10 @@
 #include <errno.h>
 #include <log/log.h>
 #include <string.h>
+#include <system/thread_defs.h>
+#include <unistd.h>
 
-#include <processgroup/processgroup.h>
-
+#include "ax_process_utils.h"
 #include "watchdog.h"
 
 static void* watchdog_main(void* param) {
@@ -29,9 +30,13 @@ static void* watchdog_main(void* param) {
     sigset_t sigset;
     int signum;
 
-    // Ensure the thread does not use little cores
-    if (!SetTaskProfiles(gettid(), {"CPUSET_SP_FOREGROUND"}, true)) {
+    pid_t tid = gettid();
+    if (!axion::process::SetThreadProfile(tid, "CPUSET_SP_TOP_APP", true)
+            && !axion::process::SetThreadProfile(tid, "CPUSET_SP_FOREGROUND", true)) {
         ALOGE("Failed to assign cpuset to the watchdog thread");
+    }
+    if (!axion::process::SetThreadPriority(tid, ANDROID_PRIORITY_HIGHEST)) {
+        ALOGW("Unable to raise watchdog thread priority (%d): errno=%d", tid, errno);
     }
 
     if (!watchdog->create_timer(sigset)) {

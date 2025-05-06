@@ -56,7 +56,9 @@
 #include <private/android_filesystem_config.h>
 #include <processgroup/processgroup.h>
 #include <psi/psi.h>
+#include <system/thread_defs.h>
 
+#include "ax_process_utils.h"
 #include "reaper.h"
 #include "statslog.h"
 #include "watchdog.h"
@@ -2328,6 +2330,17 @@ static void watchdog_callback() {
 
 static Watchdog watchdog(WATCHDOG_TIMEOUT_SEC, watchdog_callback);
 
+static void set_lmkd_critical_thread_profile(pid_t tid) {
+    if (!axion::process::SetThreadProfile(tid, "CPUSET_SP_TOP_APP", true)) {
+        if (!axion::process::SetThreadProfile(tid, "CPUSET_SP_FOREGROUND", true)) {
+            ALOGW("Failed to assign lmkd thread profile");
+        }
+    }
+    if (!axion::process::SetThreadPriority(tid, ANDROID_PRIORITY_HIGHEST)) {
+        ALOGW("Unable to raise lmkd thread priority (%d): errno=%d", tid, errno);
+    }
+}
+
 static bool is_kill_pending(void) {
     char buf[24];
 
@@ -4250,6 +4263,8 @@ int main(int argc, char **argv) {
             if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) && (errno != EINVAL)) {
                 ALOGW("mlockall failed %s", strerror(errno));
             }
+
+            set_lmkd_critical_thread_profile(gettid());
 
             /* CAP_NICE required */
             struct sched_param param = {

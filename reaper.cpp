@@ -25,11 +25,12 @@
 #include <stdlib.h>
 #include <sys/epoll.h>
 #include <sys/pidfd.h>
-#include <sys/resource.h>
 #include <sys/sysinfo.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "ax_process_utils.h"
 
 #include <processgroup/processgroup.h>
 #include <system/thread_defs.h>
@@ -53,13 +54,14 @@ static inline long get_time_diff_ms(struct timespec *from,
            (to->tv_nsec - from->tv_nsec) / (long)NS_PER_MS;
 }
 
-static void set_process_group_and_prio(uid_t uid, int pid, const std::vector<std::string>& profiles,
-                                       int prio) {
+static void set_process_group_and_prio(uid_t uid, int pid, int prio) {
     DIR* d;
     char proc_path[PATH_MAX];
     struct dirent* de;
 
-    if (!SetProcessProfilesCached(uid, pid, profiles)) {
+    if (!SetProcessProfilesCached(uid, pid, {"CPUSET_SP_TOP_APP"})
+            && !SetProcessProfilesCached(uid, pid,
+                    {"CPUSET_SP_FOREGROUND", "SCHED_SP_FOREGROUND"})) {
         ALOGW("Failed to set task profiles for the process (%d) being killed", pid);
     }
 
@@ -81,7 +83,7 @@ static void set_process_group_and_prio(uid_t uid, int pid, const std::vector<std
             continue;
         }
 
-        if (setpriority(PRIO_PROCESS, t_pid, prio) && errno != ESRCH) {
+        if (!axion::process::SetThreadPriority(t_pid, prio) && errno != ESRCH) {
             ALOGW("Unable to raise priority of killing t_pid (%d): errno=%d", t_pid, errno);
         }
     }
@@ -94,13 +96,20 @@ static void* reaper_main(void* param) {
     struct Reaper::target_proc target;
     pid_t tid = gettid();
 
-    // Ensure the thread does not use little cores
-    if (!SetTaskProfiles(tid, {"CPUSET_SP_FOREGROUND"}, true)) {
-        ALOGE("Failed to assign cpuset to the reaper thread");
+    if (!axion::process::SetThreadProfile(tid, "CPUSET_SP_TOP_APP", true)) {
+        if (!axion::process::SetThreadProfile(tid, "CPUSET_SP_FOREGROUND", true)) {
+            ALOGE("Failed to assign cpuset to the reaper thread");
+        }
     }
 
-    if (setpriority(PRIO_PROCESS, tid, ANDROID_PRIORITY_HIGHEST)) {
+    if (!axion::process::SetThreadPriority(tid, ANDROID_PRIORITY_HIGHEST)) {
         ALOGW("Unable to raise priority of the reaper thread (%d): errno=%d", tid, errno);
+    }
+
+    if (axion::process::SetSingleThreadAffinity(tid, axion::process::kCpuGroupBig)) {
+        ALOGI("Successfully set reaper thread CPU affinity to big cores!");
+    } else {
+        ALOGW("Failed to set reaper thread CPU affinity to big cores!");
     }
 
     for (;;) {
@@ -116,9 +125,7 @@ static void* reaper_main(void* param) {
             goto done;
         }
 
-        set_process_group_and_prio(target.uid, target.pid,
-                                   {"CPUSET_SP_FOREGROUND", "SCHED_SP_FOREGROUND"},
-                                   ANDROID_PRIORITY_NORMAL);
+        set_process_group_and_prio(target.uid, target.pid, ANDROID_PRIORITY_FOREGROUND);
 
         if (process_mrelease(target.pidfd, 0)) {
             ALOGE("process_mrelease %d failed: %s", target.pid, strerror(errno));
@@ -157,9 +164,6 @@ bool Reaper::is_reaping_supported() {
 
 bool Reaper::init(int comm_fd) {
     char name[16];
-    struct sched_param param = {
-        .sched_priority = 0,
-    };
 
     if (thread_cnt_ > 0) {
         // init should not be called multiple times
@@ -171,10 +175,6 @@ bool Reaper::init(int comm_fd) {
         if (pthread_create(&thread_pool_[thread_cnt_], NULL, reaper_main, this)) {
             ALOGE("pthread_create failed: %s", strerror(errno));
             continue;
-        }
-        // set normal scheduling policy for the reaper thread
-        if (pthread_setschedparam(thread_pool_[thread_cnt_], SCHED_OTHER, &param)) {
-            ALOGW("set SCHED_FIFO failed %s", strerror(errno));
         }
         snprintf(name, sizeof(name), "lmkd_reaper%d", thread_cnt_);
         if (pthread_setname_np(thread_pool_[thread_cnt_], name)) {
