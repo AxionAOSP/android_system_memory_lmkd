@@ -24,6 +24,7 @@
 #ifndef _LMKD_HOOKS_H_
 #define _LMKD_HOOKS_H_
 
+#include <stdint.h>
 #include <sys/types.h>
 
 __BEGIN_DECLS
@@ -55,6 +56,9 @@ int lmkd_free_memory_before_kill_hook(struct proc* procp, int proc_size_pages,
  * may attempt to free memory elsewhere to try to preserve system stability.
  */
 void lmkd_no_kill_candidates_hook();
+int64_t lmkd_adjust_free_swap_hook(int64_t free_swap, int64_t easy_available,
+                                   int64_t compression_ratio, int64_t compression_ratio_div,
+                                   int64_t adjusted_free_swap);
 
 #else /* LMKD_USE_HOOKS */
 
@@ -65,6 +69,10 @@ static inline int lmkd_free_memory_before_kill_hook(struct proc*, int, int,
   return 0;
 }
 static inline void lmkd_no_kill_candidates_hook() {}
+static inline int64_t lmkd_adjust_free_swap_hook(int64_t, int64_t, int64_t, int64_t,
+                                                 int64_t adjusted_free_swap) {
+    return adjusted_free_swap;
+}
 
 #endif /* LMKD_USE_HOOKS */
 

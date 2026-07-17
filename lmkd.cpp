@@ -1995,10 +1995,14 @@ static int meminfo_parse(union meminfo *mi) {
 // Swap compression ratio in the calculation can be adjusted using swap_compression_ratio tunable.
 // By setting swap_compression_ratio to 0, available memory can be ignored.
 static inline int64_t get_free_swap(union meminfo *mi) {
-    if (swap_compression_ratio)
-        return std::min(mi->field.free_swap, mi->field.easy_available * swap_compression_ratio /
-                                                     swap_compression_ratio_div);
-    return mi->field.free_swap;
+    const int64_t adjusted_free_swap =
+            swap_compression_ratio ? std::min(mi->field.free_swap,
+                                              mi->field.easy_available * swap_compression_ratio /
+                                                      swap_compression_ratio_div)
+                                   : mi->field.free_swap;
+    return lmkd_adjust_free_swap_hook(mi->field.free_swap, mi->field.easy_available,
+                                      swap_compression_ratio, swap_compression_ratio_div,
+                                      adjusted_free_swap);
 }
 
 /* /proc/vmstat parsing routines */
